@@ -1,58 +1,96 @@
+import re
+
 from app.db.session import SessionLocal
 from app.models.job import DubbingJob
 from app.schemas.job import JobStatus
 from main import run_dubbing_pipeline
 
+def clean_error_message(error: Exception) -> str:
+    """Remove terminal ANSI escape codes from an error message."""
+    message = str(error)
+    message = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", message)
+    return message[:400]
+
 def process_job(job_id: str) -> None:
     """Run the dubbing pipeline for a queued database job."""
     db = SessionLocal()
-    
+
     try:
-        # 1. Fetch and Validate Job
         job = db.get(DubbingJob, job_id)
+
         if job is None:
             print(f"Job {job_id} not found.")
             return
-            
+
         if job.status != JobStatus.QUEUED:
-            print(f"Job {job_id} is not queued. Current status: {job.status.value}")
+            print(
+                f"Job {job_id} is not queued. "
+                f"Current status: {job.status.value}"
+            )
             return
 
-        # 2. Mark Job as Processing
         video_url = job.video_url
         job.status = JobStatus.PROCESSING
         job.progress = 1
         job.message = "Starting video dubbing."
         db.commit()
 
-        # 3. Execute Pipeline outside database lock/transaction block
-        try:
-            output_path = run_dubbing_pipeline(
-                video_url=video_url,
-                job_id=job_id,
-            )
-        except Exception as exc:
-            print(f"Dubbing failed for job {job_id}: {exc}")
-            
-            # Refresh session context state to avoid flush/commit conflicts
-            db.rollback() 
-            
-            # Update to Failed Status
-            job.status = JobStatus.FAILED
-            job.message = f"Dubbing failed: {str(exc)[:400]}"
-            db.commit()
-            return
-
-        # 4. Mark Job as Completed
-        job.status = JobStatus.COMPLETED
-        job.progress = 100
-        job.message = "Dubbing completed successfully."
-        job.output_path = str(output_path)
-        db.commit()
-        print(f"Dubbing completed for job {job_id}: {output_path}")
-
     except Exception:
         db.rollback()
         raise
+
     finally:
         db.close()
+
+    try:
+        output_path = run_dubbing_pipeline(
+            video_url=video_url,
+            job_id=job_id,
+        )
+
+    except Exception as exc:
+        error_message = clean_error_message(exc)
+        print(f"Dubbing failed for job {job_id}: {error_message}")
+
+        failure_db = SessionLocal()
+
+        try:
+            failed_job = failure_db.get(DubbingJob, job_id)
+
+            if failed_job is not None:
+                failed_job.status = JobStatus.FAILED
+                failed_job.progress = 0
+                failed_job.message = (
+                    f"Dubbing failed: {error_message}"
+                )
+                failure_db.commit()
+
+        except Exception:
+            failure_db.rollback()
+            raise
+
+        finally:
+            failure_db.close()
+
+        return
+
+    completion_db = SessionLocal()
+
+    try:
+        completed_job = completion_db.get(DubbingJob, job_id)
+
+        if completed_job is not None:
+            completed_job.status = JobStatus.COMPLETED
+            completed_job.progress = 100
+            completed_job.message = "Dubbing completed successfully."
+            completed_job.output_path = str(output_path)
+            completion_db.commit()
+
+        print(f"Dubbing completed for job {job_id}: {output_path}")
+
+    except Exception:
+        completion_db.rollback()
+        raise
+
+    finally:
+        completion_db.close()

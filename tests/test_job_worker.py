@@ -122,6 +122,7 @@ def test_worker_marks_job_failed_when_pipeline_raises(monkeypatch):
 
             assert job is not None
             assert job.status == JobStatus.FAILED
+            assert job.progress == 0
             assert job.message == (
                 "Dubbing failed: Simulated dubbing failure"
             )
@@ -184,3 +185,13 @@ def test_worker_skips_nonexistent_job(monkeypatch):
     finally:
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
+
+
+def test_clean_error_message_removes_ansi_codes():
+    error = "\x1b[0;31mERROR:\x1b[0m Download failed"
+
+    result = job_worker.clean_error_message(
+        Exception(error)
+    )
+
+    assert result == "ERROR: Download failed"
