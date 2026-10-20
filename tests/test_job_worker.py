@@ -68,14 +68,22 @@ def test_worker_marks_job_completed_and_saves_output(
     try:
         job_id = create_job(TestingSessionLocal)
         output_file = tmp_path / "dubbed_video.mp4"
-
         expected_job_id = job_id
 
-        def fake_pipeline(video_url: str, job_id: str) -> Path:
+        def fake_pipeline(
+            video_url: str,
+            job_id: str,
+            progress_callback=None,
+        ) -> Path:
             assert video_url == (
                 "https://www.youtube.com/watch?v=example"
             )
             assert job_id == expected_job_id
+
+            if progress_callback is not None:
+                progress_callback(20, "Video downloaded.")
+                progress_callback(55, "Translation completed.")
+
             return output_file
 
         monkeypatch.setattr(
@@ -106,7 +114,14 @@ def test_worker_marks_job_failed_when_pipeline_raises(monkeypatch):
     try:
         job_id = create_job(TestingSessionLocal)
 
-        def failing_pipeline(video_url: str, job_id: str) -> Path:
+        def failing_pipeline(
+            video_url: str,
+            job_id: str,
+            progress_callback=None,
+        ) -> Path:
+            if progress_callback is not None:
+                progress_callback(20, "Video downloaded.")
+
             raise RuntimeError("Simulated dubbing failure")
 
         monkeypatch.setattr(
@@ -141,7 +156,11 @@ def test_worker_skips_completed_job(monkeypatch):
             status=JobStatus.COMPLETED,
         )
 
-        def unexpected_pipeline(video_url: str, job_id: str) -> Path:
+        def unexpected_pipeline(
+            video_url: str,
+            job_id: str,
+            progress_callback=None,
+        ) -> Path:
             raise AssertionError(
                 "Pipeline must not run for a completed job"
             )
@@ -169,7 +188,11 @@ def test_worker_skips_nonexistent_job(monkeypatch):
     engine, TestingSessionLocal = create_test_database(monkeypatch)
 
     try:
-        def unexpected_pipeline(video_url: str, job_id: str) -> Path:
+        def unexpected_pipeline(
+            video_url: str,
+            job_id: str,
+            progress_callback=None,
+        ) -> Path:
             raise AssertionError(
                 "Pipeline must not run for a nonexistent job"
             )

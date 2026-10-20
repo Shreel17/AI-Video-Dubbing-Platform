@@ -4,6 +4,7 @@ import math
 import subprocess
 import time
 from pathlib import Path
+from typing import Callable
 
 import edge_tts
 from faster_whisper import WhisperModel
@@ -27,6 +28,22 @@ WHISPER_MODEL = "base"
 SAMPLE_RATE = 44100
 CHUNK_SECONDS = 60
 
+ProgressCallback = Callable[[int, str], None]
+
+
+# ============================================================
+# HELPER: REPORT PIPELINE PROGRESS
+# ============================================================
+
+def report_progress(
+    progress_callback: ProgressCallback | None,
+    progress: int,
+    message: str,
+) -> None:
+    """Report pipeline progress when a callback is provided."""
+    if progress_callback is not None:
+        progress_callback(progress, message)
+
 
 # ============================================================
 # HELPER: RUN A SUBPROCESS WITH USEFUL ERROR DETAILS
@@ -34,7 +51,6 @@ CHUNK_SECONDS = 60
 
 def run_command(command: list[str]) -> subprocess.CompletedProcess:
     """Run a command and report useful details if it fails."""
-
     try:
         return subprocess.run(
             command,
@@ -62,7 +78,6 @@ def run_command(command: list[str]) -> subprocess.CompletedProcess:
 
 def download_video(url: str) -> Path:
     """Download a YouTube video and return its local file path."""
-
     if not url.startswith(
         (
             "https://www.youtube.com/",
@@ -87,10 +102,8 @@ def download_video(url: str) -> Path:
         info = downloader.extract_info(url, download=True)
         video_path = Path(downloader.prepare_filename(info))
 
-    # yt-dlp may merge separate streams into an MP4 file.
     if not video_path.exists():
         merged_path = video_path.with_suffix(".mp4")
-
         if merged_path.exists():
             video_path = merged_path
 
@@ -100,7 +113,6 @@ def download_video(url: str) -> Path:
         )
 
     print(f"Downloaded: {video_path.name}")
-
     return video_path
 
 
@@ -110,7 +122,6 @@ def download_video(url: str) -> Path:
 
 def transcribe_video(video_path: Path):
     """Recognize speech and retain the original timestamps."""
-
     print("\n[2/5] Transcribing speech...")
 
     model = WhisperModel(
@@ -156,7 +167,6 @@ def transcribe_video(video_path: Path):
 
 def translate_to_english(transcript, source_language: str):
     """Translate recognized speech into English using Argos."""
-
     if source_language == "en":
         print(
             "\n[3/5] Speech is already English; "
@@ -215,7 +225,6 @@ def translate_to_english(transcript, source_language: str):
             )
 
     print("Local translation finished.")
-
     return translated_transcript
 
 
@@ -229,7 +238,6 @@ async def generate_speech(
     total_duration: float,
 ):
     """Generate speech clips and mix them in timeline chunks."""
-
     if not transcript:
         raise ValueError(
             "Cannot generate speech from an empty transcript."
@@ -245,19 +253,17 @@ async def generate_speech(
     CLIPS_DIR.mkdir(parents=True, exist_ok=True)
     output_audio.parent.mkdir(parents=True, exist_ok=True)
 
+    clip_paths = []
+    clip_durations = []
+
     # --------------------------------------------------------
     # STEP A: GENERATE, VALIDATE, AND REUSE SPEECH CLIPS
     # --------------------------------------------------------
-
-    clip_paths = []
-    clip_durations = []
 
     for index, segment in enumerate(transcript):
         clip_path = CLIPS_DIR / f"clip_{index:05d}.mp3"
         clip_duration = 0.0
 
-        # Retry each clip up to three times.
-        # Reuse an existing clip when it is valid.
         for attempt in range(3):
             try:
                 if (
@@ -275,9 +281,7 @@ async def generate_speech(
                         ]
                     )
 
-                    clip_duration = float(
-                        probe.stdout.strip()
-                    )
+                    clip_duration = float(probe.stdout.strip())
 
                     if (
                         not math.isfinite(clip_duration)
@@ -286,7 +290,6 @@ async def generate_speech(
                         raise RuntimeError(
                             "Audio clip has invalid duration."
                         )
-
                 else:
                     speech = edge_tts.Communicate(
                         text=segment["text"],
@@ -314,9 +317,7 @@ async def generate_speech(
                         ]
                     )
 
-                    clip_duration = float(
-                        probe.stdout.strip()
-                    )
+                    clip_duration = float(probe.stdout.strip())
 
                     if (
                         not math.isfinite(clip_duration)
@@ -326,11 +327,9 @@ async def generate_speech(
                             "Audio clip has invalid duration."
                         )
 
-                # The clip is valid, so stop retrying.
                 break
 
             except Exception as error:
-                # Remove an incomplete or invalid clip before retrying.
                 if clip_path.exists():
                     clip_path.unlink()
 
@@ -368,23 +367,15 @@ async def generate_speech(
     # STEP B: PREPARE SORTED CLIPS AND TRACKING VARIABLES
     # --------------------------------------------------------
 
-    chunk_count = math.ceil(
-        total_duration / CHUNK_SECONDS
-    )
-
+    chunk_count = math.ceil(total_duration / CHUNK_SECONDS)
     chunk_paths = []
-
-    # Keep the concat list with the test's temporary audio chunks.
     concat_list = CLIPS_DIR.parent / "audio_chunks.txt"
 
-    # Sort clips by their original transcript start times.
     timed_clips = sorted(
         zip(transcript, clip_paths, clip_durations),
         key=lambda item: float(item[0]["start"]),
     )
 
-    # Track the next clip to examine and clips overlapping
-    # the current timeline chunk.
     next_clip_index = 0
     active_clips = []
 
@@ -399,23 +390,17 @@ async def generate_speech(
 
             chunk_end = chunk_start + chunk_length
 
-            # Step 31: Keep temporary chunks beside the test clips.
             chunk_path = (
                 CLIPS_DIR.parent
                 / f"dub_chunk_{chunk_index:05d}.mp3"
             )
 
-            # Remove clips that ended before this chunk starts.
             active_clips = [
                 item
                 for item in active_clips
-                if (
-                    float(item[0]["start"]) + item[2]
-                    > chunk_start
-                )
+                if float(item[0]["start"]) + item[2] > chunk_start
             ]
 
-            # Add clips starting before this chunk ends.
             while next_clip_index < len(timed_clips):
                 candidate = timed_clips[next_clip_index]
                 candidate_start = float(candidate[0]["start"])
@@ -426,7 +411,6 @@ async def generate_speech(
                 active_clips.append(candidate)
                 next_clip_index += 1
 
-            # Input 0 is a silent audio track for this chunk.
             command = [
                 "ffmpeg",
                 "-y",
@@ -438,30 +422,18 @@ async def generate_speech(
             filters = []
             voice_labels = []
 
-            # Process only clips that may overlap this chunk.
             for segment, clip_path, clip_duration in active_clips:
                 speech_start = float(segment["start"])
                 speech_end = speech_start + clip_duration
 
-                # Find the part of this clip inside the chunk.
-                overlap_start = max(
-                    speech_start,
-                    chunk_start,
-                )
-
-                overlap_end = min(
-                    speech_end,
-                    chunk_end,
-                )
+                overlap_start = max(speech_start, chunk_start)
+                overlap_end = min(speech_end, chunk_end)
 
                 if overlap_end <= overlap_start:
                     continue
 
                 input_index = len(voice_labels) + 1
-
-                command.extend(
-                    ["-i", str(clip_path)]
-                )
+                command.extend(["-i", str(clip_path)])
 
                 trim_start = overlap_start - speech_start
                 trim_duration = overlap_end - overlap_start
@@ -485,11 +457,8 @@ async def generate_speech(
 
                 voice_labels.append(f"[{label}]")
 
-            # Mix the active speech clips over silence.
             if voice_labels:
-                mix_inputs = (
-                    "[0:a]" + "".join(voice_labels)
-                )
+                mix_inputs = "[0:a]" + "".join(voice_labels)
 
                 filters.append(
                     f"{mix_inputs}"
@@ -506,10 +475,7 @@ async def generate_speech(
                     ]
                 )
             else:
-                # Preserve silence when no clips overlap.
-                command.extend(
-                    ["-map", "0:a:0"]
-                )
+                command.extend(["-map", "0:a:0"])
 
             command.extend(
                 [
@@ -532,10 +498,7 @@ async def generate_speech(
         # STEP C: JOIN ALL TIMELINE CHUNKS
         # ----------------------------------------------------
 
-        with concat_list.open(
-            "w",
-            encoding="utf-8",
-        ) as file:
+        with concat_list.open("w", encoding="utf-8") as file:
             for chunk_path in chunk_paths:
                 safe_path = (
                     str(chunk_path.resolve())
@@ -543,9 +506,7 @@ async def generate_speech(
                     .replace("'", r"'\''")
                 )
 
-                file.write(
-                    f"file '{safe_path}'\n"
-                )
+                file.write(f"file '{safe_path}'\n")
 
         run_command(
             [
@@ -563,7 +524,6 @@ async def generate_speech(
         print(f"Generated audio: {output_audio}")
 
     finally:
-        # Remove temporary timeline chunks and concat list.
         for chunk_path in chunk_paths:
             if chunk_path.exists():
                 chunk_path.unlink()
@@ -578,7 +538,6 @@ async def generate_speech(
 
 def get_video_duration(video_path: Path) -> float:
     """Return the original video's duration in seconds."""
-
     result = run_command(
         [
             "ffprobe",
@@ -614,7 +573,6 @@ def combine_video(
     output_video: Path,
 ):
     """Combine the original video with the generated English dub."""
-
     print("\n[5/5] Combining video and dubbed audio...")
 
     duration = get_video_duration(video_path)
@@ -642,24 +600,39 @@ def combine_video(
     print(f"\nDubbed video saved: {output_video}")
 
 
+# ============================================================
+# BACKGROUND JOB PIPELINE WITH PROGRESS CALLBACK
+# ============================================================
+
 def run_dubbing_pipeline(
     video_url: str,
     job_id: str,
+    progress_callback: ProgressCallback | None = None,
 ) -> Path:
-    """Run the dubbing pipeline for a background job."""
-
+    """Run the dubbing pipeline and report background-job progress."""
     started = time.perf_counter()
+
+    def report_progress(progress: int, message: str) -> None:
+        """Report pipeline progress when a callback is provided."""
+        if progress_callback is not None:
+            progress_callback(progress, message)
+
+    report_progress(5, "Downloading video.")
 
     video_path = download_video(video_url)
 
-    transcript, source_language = transcribe_video(
-        video_path
-    )
+    report_progress(20, "Video downloaded. Transcribing speech.")
+
+    transcript, source_language = transcribe_video(video_path)
+
+    report_progress(40, "Transcription completed. Translating speech.")
 
     transcript = translate_to_english(
         transcript,
         source_language,
     )
+
+    report_progress(55, "Translation completed. Preparing speech generation.")
 
     video_duration = get_video_duration(video_path)
 
@@ -671,6 +644,8 @@ def run_dubbing_pipeline(
         job_output_dir / f"{video_path.stem}_english_dub.mp4"
     )
 
+    report_progress(55, "Generating English speech.")
+
     asyncio.run(
         generate_speech(
             transcript,
@@ -679,6 +654,8 @@ def run_dubbing_pipeline(
         )
     )
 
+    report_progress(80, "Speech generated. Combining final video.")
+
     combine_video(
         video_path,
         dubbed_audio,
@@ -686,20 +663,23 @@ def run_dubbing_pipeline(
     )
 
     elapsed = time.perf_counter() - started
+
     print(
         f"Job {job_id} completed in "
         f"{elapsed / 60:.2f} minutes."
     )
 
+    report_progress(100, "Dubbing completed successfully.")
+
     return output_video
 
+
 # ============================================================
-# MAIN PIPELINE
+# MAIN PIPELINE: STANDALONE EXECUTION
 # ============================================================
 
 def main():
     """Run the complete video dubbing pipeline."""
-
     started = time.perf_counter()
 
     video_url = input(
@@ -708,9 +688,7 @@ def main():
 
     video_path = download_video(video_url)
 
-    transcript, source_language = transcribe_video(
-        video_path
-    )
+    transcript, source_language = transcribe_video(video_path)
 
     transcript = translate_to_english(
         transcript,
@@ -753,9 +731,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-
     except KeyboardInterrupt:
         print("\nProcess interrupted by the user.")
-
     except Exception as error:
         print(f"\nERROR: {error}")
