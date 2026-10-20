@@ -1,0 +1,10 @@
+yt-dlp
+faster-whisper
+edge-tts
+deep-translator
+tqdm
+fastapi
+uvicorn[standard]
+pydantic-settings
+sqlalchemy
+psycopg[binary]
