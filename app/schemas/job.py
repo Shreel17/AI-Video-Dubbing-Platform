@@ -1,3 +1,5 @@
+
+from datetime import datetime
 from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
@@ -8,6 +10,7 @@ class JobStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class DubbingJobCreate(BaseModel):
@@ -29,8 +32,13 @@ class DubbingJobCreate(BaseModel):
 
 
 class DubbingJobResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     job_id: str
     status: JobStatus
     progress: int = Field(ge=0, le=100)
     message: str
-    output_path:str | None = None
+    output_path: str | None = None
+    created_at: datetime | None = None
+    completed_at: datetime | None = None
+    processing_time_seconds: float | None = None

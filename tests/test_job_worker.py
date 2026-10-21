@@ -218,3 +218,40 @@ def test_clean_error_message_removes_ansi_codes():
     )
 
     assert result == "ERROR: Download failed"
+
+
+def test_worker_skips_cancelled_job(monkeypatch):
+    engine, TestingSessionLocal = create_test_database(monkeypatch)
+
+    try:
+        job_id = create_job(
+            TestingSessionLocal,
+            status=JobStatus.CANCELLED,
+        )
+
+        def unexpected_pipeline(
+            video_url: str,
+            job_id: str,
+            progress_callback=None,
+        ) -> Path:
+            raise AssertionError(
+                "Pipeline must not run for a cancelled job"
+            )
+
+        monkeypatch.setattr(
+            job_worker,
+            "run_dubbing_pipeline",
+            unexpected_pipeline,
+        )
+
+        job_worker.process_job(job_id)
+
+        with TestingSessionLocal() as db:
+            job = db.get(DubbingJob, job_id)
+
+            assert job is not None
+            assert job.status == JobStatus.CANCELLED
+
+    finally:
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
