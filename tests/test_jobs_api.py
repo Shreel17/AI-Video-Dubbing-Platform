@@ -617,3 +617,78 @@ def teardown_module():
     app.dependency_overrides.clear()
     Base.metadata.drop_all(bind=test_engine)
     test_engine.dispose()
+
+
+def test_create_job_dispatch_failure_returns_503_and_preserves_job():
+    with patch(
+        "app.api.jobs.process_dubbing_job.delay",
+        side_effect=RuntimeError("Celery unavailable"),
+    ):
+        response = client.post(
+            "/api/v1/jobs",
+            json={
+                "video_url": "https://www.youtube.com/watch?v=dispatchfail123",
+                "target_language": "hi",
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Job was saved, but the task could not be queued. "
+        "Please check Redis and retry later."
+    )
+
+    with TestingSessionLocal() as db:
+        jobs = (
+            db.query(DubbingJob)
+            .filter(
+                DubbingJob.video_url
+                == "https://www.youtube.com/watch?v=dispatchfail123"
+            )
+            .all()
+        )
+
+        assert len(jobs) == 1
+        assert jobs[0].status == JobStatus.QUEUED
+        assert jobs[0].progress == 0
+
+
+def test_retry_dispatch_failure_returns_503_and_preserves_queued_job():
+    with patch("app.api.jobs.process_dubbing_job.delay"):
+        create_response = client.post(
+            "/api/v1/jobs",
+            json={
+                "video_url": "https://www.youtube.com/watch?v=retrydispatchfail123",
+                "target_language": "hi",
+            },
+        )
+
+    assert create_response.status_code == 202
+    job_id = create_response.json()["job_id"]
+
+    with TestingSessionLocal() as db:
+        job = db.get(DubbingJob, job_id)
+        assert job is not None
+        job.status = JobStatus.FAILED
+        job.progress = 80
+        job.output_path = "old-output.mp4"
+        job.completed_at = datetime.now(timezone.utc)
+        job.processing_time_seconds = 12.5
+        db.commit()
+
+    with patch(
+        "app.api.jobs.process_dubbing_job.delay",
+        side_effect=RuntimeError("Celery unavailable"),
+    ):
+        response = client.post(f"/api/v1/jobs/{job_id}/retry")
+
+    assert response.status_code == 503
+
+    with TestingSessionLocal() as db:
+        job = db.get(DubbingJob, job_id)
+        assert job is not None
+        assert job.status == JobStatus.QUEUED
+        assert job.progress == 0
+        assert job.output_path is None
+        assert job.completed_at is None
+        assert job.processing_time_seconds is None
