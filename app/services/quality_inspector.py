@@ -45,7 +45,7 @@ def build_quality_report(
     source_video: Path,
     dubbed_audio: Path,
     output_video: Path,
-    transcript_segment_count: int,
+    transcript_segment_count: int | None,
     report_path: Path,
 ) -> dict:
     """Inspect generated media and save a JSON quality report."""
@@ -130,18 +130,34 @@ def build_quality_report(
                 "Output video duration differs from the original video."
             )
 
-        metrics["transcript_segment_count"] = int(transcript_segment_count)
-        segments_ok = transcript_segment_count > 0
-        add_check(
-            "speech_segments",
-            "Speech segments",
-            segments_ok,
-            f"{transcript_segment_count} speech segments processed."
-            if segments_ok
-            else "No transcript speech segments were recorded.",
+        metrics["transcript_segment_count"] = (
+            int(transcript_segment_count)
+            if transcript_segment_count is not None
+            else None
         )
-        if not segments_ok:
-            warnings.append("No transcript speech segments were recorded.")
+        if transcript_segment_count is None:
+            add_check(
+                "speech_segments",
+                "Speech segments",
+                False,
+                "Transcript segment count is unavailable for this historical report.",
+            )
+            warnings.append(
+                "Transcript segment count is unavailable; it was not recorded "
+                "for this historical job."
+            )
+        else:
+            segments_ok = transcript_segment_count > 0
+            add_check(
+                "speech_segments",
+                "Speech segments",
+                segments_ok,
+                f"{transcript_segment_count} speech segments processed."
+                if segments_ok
+                else "No transcript speech segments were recorded.",
+            )
+            if not segments_ok:
+                warnings.append("No transcript speech segments were recorded.")
 
     except Exception as error:
         warnings.append(f"One or more media checks could not finish: {error}")

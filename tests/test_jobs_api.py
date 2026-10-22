@@ -772,3 +772,132 @@ def test_quality_report_incomplete_job_returns_conflict():
     assert response.json()["detail"] == (
         "Quality report is available only for completed jobs"
     )
+
+
+def test_quality_report_recovers_only_exactly_matched_download(monkeypatch):
+    import json
+    import app.api.jobs as jobs_module
+    import app.services.quality_inspector as inspector_module
+
+    with patch("app.api.jobs.process_dubbing_job.delay"):
+        create_response = client.post(
+            "/api/v1/jobs",
+            json={
+                "video_url": "https://www.youtube.com/watch?v=legacyquality123",
+                "target_language": "hi",
+            },
+        )
+
+    assert create_response.status_code == 202
+    job_id = create_response.json()["job_id"]
+
+    with TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        downloads = temp / "downloads"
+        outputs = temp / "outputs"
+        downloads.mkdir()
+        outputs.mkdir()
+
+        # This is the exact source/output filename pair used by the pipeline.
+        source = downloads / "Small Talk ｜ Everyday English.mp4"
+        source.write_bytes(b"test source")
+        output = outputs / "Small Talk ｜ Everyday English_hi_dub.mp4"
+        output.write_bytes(b"test output")
+        audio = outputs / "dubbed_audio_hi.mp3"
+        audio.write_bytes(b"test audio")
+
+        monkeypatch.setattr(jobs_module, "DOWNLOAD_DIR", downloads)
+
+        def fake_build_quality_report(
+            source_video,
+            dubbed_audio,
+            output_video,
+            transcript_segment_count,
+            report_path,
+        ):
+            assert Path(source_video).resolve() == source.resolve()
+            assert Path(dubbed_audio).resolve() == audio.resolve()
+            assert Path(output_video).resolve() == output.resolve()
+            assert transcript_segment_count is None
+            Path(report_path).write_text(
+                json.dumps({
+                    "overall_status": "review_recommended",
+                    "metrics": {"transcript_segment_count": None},
+                    "warnings": [
+                        "Transcript segment count is unavailable."
+                    ],
+                }),
+                encoding="utf-8",
+            )
+
+        monkeypatch.setattr(
+            inspector_module,
+            "build_quality_report",
+            fake_build_quality_report,
+        )
+
+        with TestingSessionLocal() as db:
+            job = db.get(DubbingJob, job_id)
+            assert job is not None
+            job.status = JobStatus.COMPLETED
+            job.progress = 100
+            job.output_path = str(output)
+            db.commit()
+
+        response = client.get(
+            f"/api/v1/jobs/{job_id}/quality-report"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["metrics"]["transcript_segment_count"] is None
+        assert report_file_exists(output.parent / "quality_report.json")
+
+
+def report_file_exists(path: Path) -> bool:
+    return path.is_file()
+
+
+def test_quality_report_does_not_guess_unmatched_download(monkeypatch):
+    import app.api.jobs as jobs_module
+
+    with patch("app.api.jobs.process_dubbing_job.delay"):
+        create_response = client.post(
+            "/api/v1/jobs",
+            json={
+                "video_url": "https://www.youtube.com/watch?v=unmatchedlegacy123",
+                "target_language": "hi",
+            },
+        )
+
+    assert create_response.status_code == 202
+    job_id = create_response.json()["job_id"]
+
+    with TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        downloads = temp / "downloads"
+        outputs = temp / "outputs"
+        downloads.mkdir()
+        outputs.mkdir()
+
+        # Deliberately similar, but not an exact source filename match.
+        (downloads / "Small Talk - Everyday English.mp4").write_bytes(b"source")
+        output = outputs / "Small Talk ｜ Everyday English_hi_dub.mp4"
+        output.write_bytes(b"output")
+        (outputs / "dubbed_audio_hi.mp3").write_bytes(b"audio")
+
+        monkeypatch.setattr(jobs_module, "DOWNLOAD_DIR", downloads)
+
+        with TestingSessionLocal() as db:
+            job = db.get(DubbingJob, job_id)
+            assert job is not None
+            job.status = JobStatus.COMPLETED
+            job.progress = 100
+            job.output_path = str(output)
+            db.commit()
+
+        response = client.get(
+            f"/api/v1/jobs/{job_id}/quality-report"
+        )
+
+        assert response.status_code == 404
+        assert not (outputs / "quality_report.json").exists()

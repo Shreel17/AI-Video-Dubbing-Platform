@@ -1,3 +1,5 @@
+import json
+import logging
 import shutil
 from uuid import uuid4
 from pathlib import Path
@@ -11,7 +13,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse,JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import case, desc, func
 from sqlalchemy.orm import Session
 
@@ -24,6 +26,91 @@ from app.schemas.job import (
 )
 from app.schemas.job_stats import DubbingJobStats
 from app.workers.tasks import process_dubbing_job
+
+
+logger = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DOWNLOAD_DIR = PROJECT_ROOT / "downloads"
+
+
+def recover_quality_report(job, output_file: Path, report_file: Path) -> bool:
+    """Recover a missing report only when source and audio are verified."""
+    from app.services.quality_inspector import build_quality_report
+
+    output_file = output_file.resolve()
+    report_file = report_file.resolve()
+
+    if not output_file.is_file():
+        return False
+
+    audio_candidates = [
+        output_file.parent / f"dubbed_audio_{job.target_language}.mp3",
+        output_file.parent / "dubbed_audio.mp3",
+    ]
+    existing_audio = list(dict.fromkeys(
+        p.resolve() for p in audio_candidates if p.is_file()
+    ))
+
+    if len(existing_audio) != 1:
+        logger.warning(
+            "Cannot recover report for job %s: expected exactly one "
+            "matching audio file, found %s",
+            job.id, len(existing_audio),
+        )
+        return False
+
+    source_reference = Path(job.video_url).expanduser()
+    if source_reference.is_file():
+        source_video = source_reference.resolve()
+    else:
+        output_stem = output_file.stem
+        suffixes = (
+            f"_{job.target_language}_dub",
+            "_english_dub",
+        )
+        matched_suffix = next(
+            (suffix for suffix in suffixes if output_stem.endswith(suffix)),
+            None,
+        )
+        if matched_suffix is None:
+            return False
+
+        source_stem = output_stem[:-len(matched_suffix)]
+        source_candidates = [
+            p.resolve()
+            for p in DOWNLOAD_DIR.iterdir()
+            if p.is_file()
+            and p.stem.casefold() == source_stem.casefold()
+            and p.suffix.lower() in {
+                ".mp4", ".mov", ".mkv", ".avi", ".webm"
+            }
+        ] if DOWNLOAD_DIR.is_dir() else []
+
+        if len(source_candidates) != 1:
+            logger.warning(
+                "Cannot recover report for job %s: found %s matching sources",
+                job.id, len(source_candidates),
+            )
+            return False
+
+        source_video = source_candidates[0]
+
+    try:
+        build_quality_report(
+            source_video=source_video,
+            dubbed_audio=existing_audio[0],
+            output_video=output_file,
+            transcript_segment_count=None,
+            report_path=report_file,
+        )
+    except Exception:
+        logger.exception(
+            "Could not recover quality report for job %s", job.id
+        )
+        return False
+
+    return report_file.is_file()
 
 
 router = APIRouter(prefix="/jobs", tags=["Dubbing Jobs"])
@@ -351,17 +438,18 @@ def get_quality_report(
     report_file = output_file.parent / "quality_report.json"
 
     if not report_file.is_file():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Quality report not found for this job",
-        )
+        recovered = recover_quality_report(job, output_file, report_file)
+        if not recovered:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Quality report not found for this job",
+            )
 
     try:
-        import json
-
         with report_file.open("r", encoding="utf-8") as file:
             report = json.load(file)
     except (OSError, ValueError):
+        logger.exception("Quality report could not be read for job %s", job.id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Quality report could not be read",
