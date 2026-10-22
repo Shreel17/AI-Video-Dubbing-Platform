@@ -11,3 +11,4 @@ psycopg[binary]
 alembic==1.20.0
 celery[redis]
 python-dotenv
+python-multipart==0.0.32

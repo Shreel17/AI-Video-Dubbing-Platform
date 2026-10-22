@@ -1,14 +1,17 @@
+import shutil
 from uuid import uuid4
 from pathlib import Path
-
 from fastapi import (
     APIRouter,
     Depends,
+    File,
+    Form,
     HTTPException,
     Query,
+    UploadFile,
     status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse,JSONResponse
 from sqlalchemy import case, desc, func
 from sqlalchemy.orm import Session
 
@@ -25,6 +28,18 @@ from app.workers.tasks import process_dubbing_job
 
 router = APIRouter(prefix="/jobs", tags=["Dubbing Jobs"])
 
+UPLOAD_DIR = Path(__file__).resolve().parents[2] / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB
+
+ALLOWED_VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".webm",
+}
 
 def build_job_response(job: DubbingJob) -> DubbingJobResponse:
     """Convert a database job into the public API response."""
@@ -306,6 +321,55 @@ def download_dubbing_output(
     )
 
 
+@router.get("/{job_id}/quality-report")
+def get_quality_report(
+    job_id: str,
+    db: Session = Depends(get_db),
+):
+    """Return the automated quality report for a completed dubbing job."""
+    job = db.get(DubbingJob, job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dubbing job not found",
+        )
+
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Quality report is available only for completed jobs",
+        )
+
+    if not job.output_path:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Output video path is not available",
+        )
+
+    output_file = Path(job.output_path)
+    report_file = output_file.parent / "quality_report.json"
+
+    if not report_file.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quality report not found for this job",
+        )
+
+    try:
+        import json
+
+        with report_file.open("r", encoding="utf-8") as file:
+            report = json.load(file)
+    except (OSError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Quality report could not be read",
+        )
+
+    return JSONResponse(content=report)
+
+
 @router.post(
     "",
     response_model=DubbingJobResponse,
@@ -361,3 +425,117 @@ def get_dubbing_job(
         )
 
     return build_job_response(job)
+
+
+@router.post(
+    "/upload",
+    response_model=DubbingJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def upload_dubbing_job(
+    file: UploadFile = File(...),
+    target_language: str = Form(default="en"),
+    source_language: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+) -> DubbingJobResponse:
+    """Upload a local video and queue a dubbing job."""
+    suffix = Path(file.filename or "").suffix.lower()
+
+    if suffix not in ALLOWED_VIDEO_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Unsupported video format. Use MP4, MOV, MKV, AVI, or WEBM."
+            ),
+        )
+
+    # Validate languages using the same rules as the main pipeline.
+    from main import validate_target_language
+
+    try:
+        target_language = validate_target_language(target_language)
+
+        if source_language is not None:
+            source_language = source_language.strip().lower()
+
+            if (
+                len(source_language) < 2
+                or len(source_language) > 10
+            ):
+                raise ValueError("Invalid source language code.")
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    job_id = str(uuid4())
+    upload_path = UPLOAD_DIR / f"{job_id}{suffix}"
+    total_size = 0
+
+    try:
+        with upload_path.open("wb") as destination:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+
+                if not chunk:
+                    break
+
+                total_size += len(chunk)
+
+                if total_size > MAX_UPLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail="Video exceeds the 500 MB upload limit.",
+                    )
+
+                destination.write(chunk)
+
+        if total_size == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The uploaded file is empty.",
+            )
+
+        job = DubbingJob(
+            id=job_id,
+            video_url=str(upload_path.resolve()),
+            source_language=source_language,
+            target_language=target_language,
+            status=JobStatus.QUEUED,
+            progress=0,
+            message="Uploaded video accepted and queued for processing.",
+        )
+
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        response = build_job_response(job)
+
+        try:
+            process_dubbing_job.delay(job.id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Upload was saved, but the task could not be queued. "
+                    "Check Redis and retry later."
+                ),
+            ) from exc
+
+        return response
+
+    except Exception:
+        db.rollback()
+
+        # Do not delete the file after the job has been saved:
+        # it may already be queued for processing.
+        if db.get(DubbingJob, job_id) is None and upload_path.exists():
+            upload_path.unlink(missing_ok=True)
+
+        raise
+
+    finally:
+        file.file.close()

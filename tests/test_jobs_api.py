@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+﻿from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -692,3 +692,83 @@ def test_retry_dispatch_failure_returns_503_and_preserves_queued_job():
         assert job.output_path is None
         assert job.completed_at is None
         assert job.processing_time_seconds is None
+
+def test_quality_report_returns_report_for_completed_job():
+    import json
+
+    with patch("app.api.jobs.process_dubbing_job.delay"):
+        create_response = client.post(
+            "/api/v1/jobs",
+            json={
+                "video_url": "https://www.youtube.com/watch?v=quality123",
+                "target_language": "hi",
+            },
+        )
+
+    assert create_response.status_code == 202
+    job_id = create_response.json()["job_id"]
+
+    expected_report = {
+        "schema_version": 1,
+        "overall_status": "passed",
+        "checks": [],
+        "warnings": [],
+    }
+
+    with TemporaryDirectory() as temp_dir:
+        video_path = Path(temp_dir) / "dubbed_video.mp4"
+        video_path.write_bytes(b"fake mp4 test content")
+
+        report_path = video_path.parent / "quality_report.json"
+        report_path.write_text(
+            json.dumps(expected_report),
+            encoding="utf-8",
+        )
+
+        with TestingSessionLocal() as db:
+            job = db.get(DubbingJob, job_id)
+            assert job is not None
+            job.status = JobStatus.COMPLETED
+            job.progress = 100
+            job.output_path = str(video_path)
+            db.commit()
+
+        response = client.get(
+            f"/api/v1/jobs/{job_id}/quality-report"
+        )
+
+        assert response.status_code == 200
+        assert response.json() == expected_report
+
+
+def test_quality_report_nonexistent_job_returns_not_found():
+    response = client.get(
+        "/api/v1/jobs/"
+        "00000000-0000-0000-0000-000000000000/quality-report"
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Dubbing job not found"
+
+
+def test_quality_report_incomplete_job_returns_conflict():
+    with patch("app.api.jobs.process_dubbing_job.delay"):
+        create_response = client.post(
+            "/api/v1/jobs",
+            json={
+                "video_url": "https://www.youtube.com/watch?v=qualitypending",
+                "target_language": "hi",
+            },
+        )
+
+    assert create_response.status_code == 202
+    job_id = create_response.json()["job_id"]
+
+    response = client.get(
+        f"/api/v1/jobs/{job_id}/quality-report"
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Quality report is available only for completed jobs"
+    )

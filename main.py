@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import math
 import subprocess
 import time
@@ -8,7 +8,7 @@ from typing import Callable
 import edge_tts
 from faster_whisper import WhisperModel
 from yt_dlp import YoutubeDL
-
+from app.services.quality_inspector import build_quality_report
 
 # ============================================================
 # PROJECT CONFIGURATION
@@ -104,8 +104,16 @@ def validate_target_language(target_language: str | None) -> str:
 # STEP 1: DOWNLOAD VIDEO
 # ============================================================
 
+
 def download_video(url: str) -> Path:
-    """Download a YouTube video and return its local file path."""
+    """Accept an existing local video path or download a YouTube video."""
+    candidate = Path(url).expanduser()
+
+    # Uploaded files are stored locally before the job is queued.
+    if candidate.is_file():
+        print(f"\n[1/5] Using uploaded video: {candidate.name}")
+        return candidate.resolve()
+
     if not url.startswith(
         (
             "https://www.youtube.com/",
@@ -113,7 +121,9 @@ def download_video(url: str) -> Path:
             "https://youtu.be/",
         )
     ):
-        raise ValueError("Please enter a valid YouTube URL.")
+        raise ValueError(
+            "Please provide a valid YouTube URL or an existing local video file."
+        )
 
     print("\n[1/5] Downloading video...")
 
@@ -128,14 +138,13 @@ def download_video(url: str) -> Path:
         info = downloader.extract_info(url, download=True)
         prepared_path = Path(downloader.prepare_filename(info))
 
-    # yt-dlp may merge the downloaded streams into an MP4 file.
     candidates = [
         prepared_path,
         prepared_path.with_suffix(".mp4"),
     ]
 
     video_path = next(
-        (candidate for candidate in candidates if candidate.exists()),
+        (item for item in candidates if item.exists()),
         None,
     )
 
@@ -146,7 +155,6 @@ def download_video(url: str) -> Path:
 
     print(f"Downloaded: {video_path.name}")
     return video_path
-
 
 # ============================================================
 # STEP 2: TRANSCRIBE VIDEO
@@ -755,7 +763,7 @@ async def generate_speech(
 
             print(
                 f"Mixed chunk {chunk_index + 1}/{chunk_count} "
-                f"({chunk_start:.0f}s–{chunk_end:.0f}s)"
+                f"({chunk_start:.0f}sâ€“{chunk_end:.0f}s)"
             )
 
         # Join chunks into one continuous dubbed audio track.
@@ -967,7 +975,27 @@ def run_dubbing_pipeline(
         output_video,
     )
 
+    # Quality inspection is supplemental: it must not fail a valid dub.
+    try:
+        report_path = job_output_dir / "quality_report.json"
+
+        quality_report = build_quality_report(
+            source_video=video_path,
+            dubbed_audio=dubbed_audio,
+            output_video=output_video,
+            transcript_segment_count=len(transcript),
+            report_path=report_path,
+        )
+
+        print(
+            f"Quality inspection: "
+            f"{quality_report['overall_status']}"
+        )
+    except Exception as error:
+        print(f"Quality inspection could not finish: {error}")
+
     elapsed = time.perf_counter() - started
+
 
     print(
         f"Job {job_id} completed in "
