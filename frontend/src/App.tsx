@@ -42,8 +42,11 @@ type CreatedJob = {
 }
 
 type QualityCheck = {
+  id?: string
+  label?: string
   name?: string
   status?: string
+  summary?: string
   message?: string
   details?: string
 }
@@ -1184,24 +1187,25 @@ function App() {
                               </strong>
                             </p>
 
-                            {qualityReport.checks?.map((check, index) => (
-                              <div
-                                className="quality-report-check"
-                                key={`${check.name ?? 'check'}-${index}`}
-                              >
-                                <strong>
-                                  {(check.name ?? 'Quality check').replaceAll(
-                                    '_',
-                                    ' ',
-                                  )}
-                                </strong>
+                            {qualityReport.checks?.map((check, index) => {
+                              const checkLabel =
+                                check.label ?? check.name ?? check.id ?? 'Quality check'
+                              const checkSummary =
+                                check.summary ?? check.message ?? check.details
 
-                                <span>{check.status ?? 'unknown'}</span>
+                              return (
+                                <div
+                                  className="quality-report-check"
+                                  key={`${check.id ?? check.name ?? check.label ?? 'check'}-${index}`}
+                                >
+                                  <strong>{checkLabel.replaceAll('_', ' ')}</strong>
 
-                                {check.message && <p>{check.message}</p>}
-                                {check.details && <p>{check.details}</p>}
-                              </div>
-                            ))}
+                                  <span>{check.status ?? 'unknown'}</span>
+
+                                  {checkSummary && <p>{checkSummary}</p>}
+                                </div>
+                              )
+                            })}
 
                             {qualityReport.metrics && (
                               <>
